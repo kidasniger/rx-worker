@@ -1,0 +1,341 @@
+name: Rendu vidéo
+run-name: Rendu ${{ inputs.tag || inputs.fichier }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      fichier:
+        description: "Fichier HTML à convertir"
+        required: true
+        default: "kidas.html"
+      type_fichier:
+        description: "Type de source à convertir"
+        type: choice
+        options:
+          - html
+          - zip
+        required: false
+        default: "html"
+      html_principal:
+        description: "Chemin relatif du HTML principal à l’intérieur du ZIP"
+        required: false
+        default: ""
+      scale:
+        description: "Échelle (1 = 1080x1920, 0.5 = 540x960)"
+        default: "1"
+      test:
+        description: "Secondes à rendre (0 = vidéo entière)"
+        default: "0"
+      duration:
+        description: "Durée maximale en secondes (0 = durée détectée, sinon 60 s en mode universel)"
+        required: false
+        default: "0"
+      format:
+        description: "Format de sortie"
+        type: choice
+        options:
+          - auto
+          - portrait
+          - landscape
+          - square
+        required: false
+        default: "auto"
+      watermark:
+        description: "Ajouter le filigrane animé RENDRAX au MP4"
+        type: boolean
+        required: false
+        default: false
+      audio_offset_ms:
+        description: "Décalage audio en millisecondes (-2000 à 2000)"
+        type: number
+        required: false
+        default: 0
+      loudnorm:
+        description: "Égaliser le volume audio à environ -16 LUFS"
+        type: boolean
+        required: false
+        default: true
+      tag:
+        description: "Identifiant de la vidéo (rempli par la page web)"
+        required: false
+        default: ""
+      blob_id:
+        description: "Identifiant du fichier temporaire dans le stockage privé"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  render:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Préparer le HTML source
+        id: source
+        env:
+          FICHIER: ${{ inputs.fichier }}
+          BLOB_ID: ${{ inputs.blob_id }}
+          TYPE_FICHIER: ${{ inputs.type_fichier }}
+          HTML_PRINCIPAL: ${{ inputs.html_principal }}
+        run: |
+          set -euo pipefail
+          case "${TYPE_FICHIER:-html}" in
+            html|zip) TYPE_FICHIER="${TYPE_FICHIER:-html}" ;;
+            *) echo "::error::Type de fichier invalide."; exit 1 ;;
+          esac
+
+          [ -n "$BLOB_ID" ] || { echo "::error::Identifiant du fichier temporaire manquant."; exit 1; }
+          [[ "$BLOB_ID" =~ ^v[a-z0-9]{12,40}$ ]] || { echo "::error::Identifiant temporaire invalide."; exit 1; }
+          : "${ACTIONS_ID_TOKEN_REQUEST_URL:?GitHub OIDC indisponible; vérifie id-token: write}"
+          : "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:?GitHub OIDC indisponible; vérifie id-token: write}"
+          OIDC_REQUEST_URL="${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https%3A%2F%2Frendrax.vercel.app%2Fkidas-render"
+          OIDC_TOKEN="$(curl --fail --silent --show-error \
+            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "$OIDC_REQUEST_URL" | jq -er '.value')"
+          echo "::add-mask::${OIDC_TOKEN}"
+          mkdir -p kidas-tmp
+          SOURCE_FILE="kidas-tmp/input.${TYPE_FICHIER}"
+          curl --fail --silent --show-error --location --retry 2 \
+            -H "Authorization: Bearer ${OIDC_TOKEN}" \
+            "https://rendrax.vercel.app/api/runner-source?id=${BLOB_ID}&run_id=${GITHUB_RUN_ID}&type_fichier=${TYPE_FICHIER}" \
+            --output "$SOURCE_FILE"
+          test -s "$SOURCE_FILE" || { echo "::error::Le fichier temporaire est vide."; exit 1; }
+
+          if [ "$TYPE_FICHIER" = "zip" ]; then
+            [ -n "$HTML_PRINCIPAL" ] || { echo "::error::Le chemin du HTML principal est requis pour un ZIP."; exit 1; }
+            mkdir -p kidas-tmp
+            python scripts/safe_extract_zip.py \
+              --archive "$SOURCE_FILE" \
+              --dest kidas-tmp/extracted \
+              --main "$HTML_PRINCIPAL" > kidas-tmp/main-file.txt
+            SOURCE_FILE="$(cat kidas-tmp/main-file.txt)"
+            test -s "$SOURCE_FILE" && test -f "$SOURCE_FILE" || { echo "::error::HTML principal introuvable après extraction."; exit 1; }
+          else
+            [ -z "$HTML_PRINCIPAL" ] || { echo "::error::Un chemin HTML principal n’est accepté qu’avec un ZIP."; exit 1; }
+            case "${SOURCE_FILE,,}" in
+              *.html|*.htm) ;;
+              *) echo "::error::Le fichier source doit être un HTML."; exit 1 ;;
+            esac
+            test -f "$SOURCE_FILE" || { echo "::error::Fichier HTML source introuvable."; exit 1; }
+          fi
+          echo "fichier=$SOURCE_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Installer FFmpeg et ffprobe (binaires statiques en cache)
+        id: static_ffmpeg
+        continue-on-error: true
+        timeout-minutes: 6
+        uses: FedericoCarboni/setup-ffmpeg@37062fbf7149fc5578d6c57e08aed62458b375d6 # v3.1
+        with:
+          ffmpeg-version: release
+
+      - name: Installer FFmpeg depuis Ubuntu si le téléchargement échoue
+        if: steps.static_ffmpeg.outcome == 'failure'
+        timeout-minutes: 8
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          ffmpeg -version | head -n 1
+          ffprobe -version | head -n 1
+
+      - name: Vérifier les outils média
+        run: |
+          ffmpeg -version | head -n 1
+          ffprobe -version | head -n 1
+
+      - name: Installer websocket-client
+        timeout-minutes: 3
+        run: |
+          python -m pip install --disable-pip-version-check --no-input --retries 2 --timeout 20 websocket-client Pillow
+          python -c "import websocket; print('websocket-client installé:', websocket.__version__)"
+          python -c "import PIL; print('Pillow installé:', PIL.__version__)"
+
+      - name: Rendre la vidéo
+        env:
+          FICHIER: ${{ steps.source.outputs.fichier }}
+          FPS: "auto"
+          SCALE: ${{ inputs.scale }}
+          TEST: ${{ inputs.test }}
+          DURATION: ${{ inputs.duration }}
+          FORMAT: ${{ inputs.format }}
+          QUALITE: "auto"
+          WATERMARK: ${{ inputs.watermark }}
+          LOUDNORM: ${{ inputs.loudnorm }}
+          AUDIO_OFFSET_MS: ${{ inputs.audio_offset_ms }}
+        run: |
+          if ! [[ "$AUDIO_OFFSET_MS" =~ ^-?(0|[1-9][0-9]{0,3})$ ]] || (( AUDIO_OFFSET_MS < -2000 || AUDIO_OFFSET_MS > 2000 )); then
+            echo "::error::Décalage audio invalide : la valeur doit être un entier entre -2000 et 2000 ms."
+            exit 1
+          fi
+          args=(--file "$FICHIER" --fps "$FPS" --scale "$SCALE" --test "$TEST" --duration "$DURATION" --format "$FORMAT" --quality "$QUALITE" --audio-offset "$AUDIO_OFFSET_MS")
+          if [[ "${{ inputs.type_fichier }}" == "zip" ]]; then
+            args+=(--asset-root "kidas-tmp/extracted")
+          fi
+          if [[ "${WATERMARK,,}" != "true" ]]; then
+            args+=(--no-watermark)
+            echo "Filigrane animé désactivé pour ce rendu."
+          else
+            echo "Filigrane animé RENDRAX activé."
+          fi
+          if [[ "${LOUDNORM,,}" == "true" ]]; then
+            args+=(--loudnorm)
+            echo "Égalisation du volume activée (-16 LUFS)."
+          else
+            echo "Égalisation du volume désactivée."
+          fi
+          # Le suivi est activé uniquement pour les rendus identifiés par un tag RENDRAX.
+          PROGRESS_ID="${{ inputs.tag }}"
+          if [[ "$PROGRESS_ID" =~ ^v[a-z0-9]{12,40}$ ]]; then
+            : "${ACTIONS_ID_TOKEN_REQUEST_URL:?GitHub OIDC indisponible; vérifie id-token: write}"
+            : "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:?GitHub OIDC indisponible; vérifie id-token: write}"
+            OIDC_REQUEST_URL="${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https%3A%2F%2Frendrax.vercel.app%2Fkidas-render"
+            PROGRESS_TOKEN="$(curl --fail --silent --show-error \
+              -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              "$OIDC_REQUEST_URL" | jq -er '.value')"
+            echo "::add-mask::${PROGRESS_TOKEN}"
+
+            # Relaye les logs sans bloquer le rendu si le suivi Vercel est temporairement indisponible.
+            set -o pipefail
+            python html2mp4.py "${args[@]}" 2>&1 | stdbuf -oL tr '\r' '\n' | while IFS= read -r line || [[ -n "$line" ]]; do
+              printf '%s\n' "$line"
+              if [[ "$line" =~ PROGRES_RENDRAX:[[:space:]]*([0-9]+)/([0-9]+)[[:space:]]+([a-zA-Z0-9_-]+) ]]; then
+                current="${BASH_REMATCH[1]}"
+                total="${BASH_REMATCH[2]}"
+                phase="${BASH_REMATCH[3]}"
+                payload="$(jq -cn \
+                  --arg id "$PROGRESS_ID" \
+                  --arg run_id "$GITHUB_RUN_ID" \
+                  --arg phase "$phase" \
+                  --argjson current "$current" \
+                  --argjson total "$total" \
+                  '{id:$id,run_id:$run_id,current:$current,total:$total,phase:$phase}')"
+                curl --fail --silent --show-error --max-time 8 \
+                  -X POST "https://rendrax.vercel.app/api/job" \
+                  -H "Authorization: Bearer ${PROGRESS_TOKEN}" \
+                  -H "Content-Type: application/json" \
+                  --data "$payload" >/dev/null \
+                  || echo "::warning::La progression n’a pas pu être transmise à RENDRAX."
+              fi
+            done
+          else
+            python html2mp4.py "${args[@]}"
+          fi
+
+      - name: Générer les miniatures JPEG
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s globstar nullglob
+          videos=( **/*.mp4 )
+          (("${#videos[@]}" > 0)) || { echo "::error::Aucun MP4 à illustrer."; exit 1; }
+
+          for video in "${videos[@]}"; do
+            duration="$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$video")"
+            timestamp="$(awk -v d="$duration" 'BEGIN { if (d <= 2) printf "%.3f", d / 2; else print "1.000" }')"
+            thumbnail="${video%.*}.jpg"
+            generated=false
+
+            # Augmente progressivement la compression sans changer la largeur de 480 px.
+            for quality in 10 12 14 16 18 20 22 24; do
+              ffmpeg -hide_banner -loglevel error -y \
+                -ss "$timestamp" -i "$video" -frames:v 1 \
+                -vf "scale=480:-2:flags=lanczos" \
+                -q:v "$quality" -an -sn -dn "$thumbnail"
+              if [ -s "$thumbnail" ] && [ "$(stat -c '%s' "$thumbnail")" -lt 61440 ]; then
+                generated=true
+                break
+              fi
+            done
+
+            if [ "$generated" != true ]; then
+              echo "::error::Impossible de produire une miniature de moins de 60 Ko pour $video."
+              exit 1
+            fi
+            echo "Miniature créée : $thumbnail ($(stat -c '%s' "$thumbnail") octets, image à ${timestamp}s)"
+          done
+
+      - name: Publier le MP4 dans Backblaze B2 privé
+        env:
+          VIDEO_ID: ${{ inputs.tag }}
+          WATERMARK: ${{ inputs.watermark }}
+        run: |
+          set -euo pipefail
+          [[ "$VIDEO_ID" =~ ^v[a-z0-9]{12,40}$ ]] || { echo "::error::Identifiant vidéo RENDRAX invalide."; exit 1; }
+          mapfile -d '' videos < <(find . -type f -name '*.mp4' -not -path './.git/*' -print0 | sort -z)
+          (("${#videos[@]}" == 1)) || { echo "::error::Un seul MP4 final est attendu."; exit 1; }
+          video="${videos[0]}"
+          thumbnail="${video%.*}.jpg"
+          test -s "$video" && test -s "$thumbnail" || { echo "::error::MP4 ou miniature manquant."; exit 1; }
+
+          : "${ACTIONS_ID_TOKEN_REQUEST_URL:?GitHub OIDC indisponible; vérifie id-token: write}"
+          : "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:?GitHub OIDC indisponible; vérifie id-token: write}"
+          OIDC_REQUEST_URL="${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https%3A%2F%2Frendrax.vercel.app%2Fkidas-render"
+          OIDC_TOKEN="$(curl --fail --silent --show-error \
+            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "$OIDC_REQUEST_URL" | jq -er '.value')"
+          echo "::add-mask::${OIDC_TOKEN}"
+
+          video_size="$(stat -c '%s' "$video")"
+          thumbnail_size="$(stat -c '%s' "$thumbnail")"
+          probe="$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height,r_frame_rate -show_entries format=duration -of json "$video")"
+          width="$(jq -er '.streams[0].width' <<< "$probe")"
+          height="$(jq -er '.streams[0].height' <<< "$probe")"
+          duration="$(jq -er '.format.duration' <<< "$probe")"
+          fps_raw="$(jq -er '.streams[0].r_frame_rate' <<< "$probe")"
+          fps="$(awk -F/ 'NF == 2 && $2 + 0 > 0 { printf "%.3f", $1 / $2 }' <<< "$fps_raw")"
+          [[ "$width" =~ ^[1-9][0-9]{0,4}$ && "$height" =~ ^[1-9][0-9]{0,4}$ && "$duration" =~ ^[0-9]+([.][0-9]+)?$ && -n "$fps" ]] || { echo "::error::Métadonnées vidéo invalides."; exit 1; }
+          upload="$(jq -cn --arg id "$VIDEO_ID" --arg run_id "$GITHUB_RUN_ID" --argjson video_size "$video_size" --argjson thumbnail_size "$thumbnail_size" '{id:$id,run_id:$run_id,video_size:$video_size,thumbnail_size:$thumbnail_size}')"
+          urls="$(curl --fail --silent --show-error --retry 2 \
+            -X POST "https://rendrax.vercel.app/api/videos?action=upload-url" \
+            -H "Authorization: Bearer ${OIDC_TOKEN}" \
+            -H "Content-Type: application/json" --data "$upload")"
+          video_url="$(jq -er '.videoUrl' <<< "$urls")"
+          thumbnail_url="$(jq -er '.thumbnailUrl' <<< "$urls")"
+
+          curl --fail --silent --show-error --location --retry 2 \
+            -X PUT "$video_url" -H "Content-Type: video/mp4" --data-binary "@$video"
+          curl --fail --silent --show-error --location --retry 2 \
+            -X PUT "$thumbnail_url" -H "Content-Type: image/jpeg" --data-binary "@$thumbnail"
+
+          publish="$(jq -cn --arg id "$VIDEO_ID" --arg run_id "$GITHUB_RUN_ID" --argjson width "$width" --argjson height "$height" --argjson duration "$duration" --argjson fps "$fps" --arg watermark "$WATERMARK" '{id:$id,run_id:$run_id,width:$width,height:$height,duration:$duration,fps:$fps,watermark:($watermark=="true")}')"
+          curl --fail --silent --show-error --retry 2 \
+            -X POST "https://rendrax.vercel.app/api/videos?action=publish" \
+            -H "Authorization: Bearer ${OIDC_TOKEN}" \
+            -H "Content-Type: application/json" --data "$publish"
+
+
+      - name: Supprimer les fichiers temporaires
+        if: ${{ always() }}
+        env:
+          BLOB_ID: ${{ inputs.blob_id }}
+          TYPE_FICHIER: ${{ inputs.type_fichier }}
+        run: |
+          rm -rf kidas-tmp
+          if [ -n "$BLOB_ID" ]; then
+            if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+              echo "::warning::OIDC indisponible; le fichier source privé doit être supprimé manuellement dans Backblaze B2."
+              exit 0
+            fi
+            OIDC_REQUEST_URL="${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https%3A%2F%2Frendrax.vercel.app%2Fkidas-render"
+            if ! OIDC_TOKEN="$(curl --fail --silent --show-error \
+              -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              "$OIDC_REQUEST_URL" | jq -er '.value')"; then
+              echo "::warning::Impossible d’obtenir le jeton OIDC pour le nettoyage."
+              exit 0
+            fi
+            echo "::add-mask::${OIDC_TOKEN}"
+            curl --fail --silent --show-error --location --retry 2 \
+              -X POST "https://rendrax.vercel.app/api/cleanup" \
+              -H "Authorization: Bearer ${OIDC_TOKEN}" \
+              -H "Content-Type: application/json" \
+              --data "{\"id\":\"${BLOB_ID}\",\"run_id\":\"${GITHUB_RUN_ID}\",\"type_fichier\":\"${TYPE_FICHIER:-html}\"}" \
+              || echo "::warning::Le nettoyage du fichier source privé a échoué; vérifie les journaux Vercel."
+          fi
