@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 html2mp4.py - Convertit une animation HTML (type « KIDAS Vidéo ») en MP4,
 sans enregistrement d'écran : rendu image par image + audio, assemblé par FFmpeg.

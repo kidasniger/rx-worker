@@ -1,0 +1,5 @@
+# Dépendances Python du worker (installées aussi automatiquement par render.yml et tts.yml)
+websocket-client>=1.6
+Pillow>=10.0
+edge-tts>=6.1,<8
+mutagen>=1.47
