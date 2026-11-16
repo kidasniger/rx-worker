@@ -128,7 +128,8 @@ def verify_sync(path, fps, dur):
                             "-show_entries", "stream=duration", "-of", "csv=p=0", str(path)],
                            capture_output=True, text=True)
         try:
-            return float(r.stdout.strip().split("\n")[0])
+            # Certaines versions de ffprobe terminent la ligne CSV par une virgule.
+            return float(r.stdout.strip().split("\n")[0].rstrip(","))
         except ValueError:
             return None
 

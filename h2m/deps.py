@@ -4,6 +4,7 @@ import re
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 from h2m.ui import die, info
 
@@ -29,6 +30,15 @@ def find_chrome():
         p = shutil.which(n)
         if p:
             return p
+    # Chromium installé par Playwright dans le cache utilisateur (aucun droit root requis).
+    for base in (os.path.expanduser("~/.cache/ms-playwright"), "/root/.cache/ms-playwright"):
+        try:
+            candidates = sorted(Path(base).glob("chromium-*/chrome-linux*/chrome"))
+        except OSError:
+            candidates = []
+        for p in candidates:
+            if os.access(p, os.X_OK):
+                return str(p)
     return None
 
 

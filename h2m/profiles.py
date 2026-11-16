@@ -1,6 +1,7 @@
 """Détection des profils de fichiers, correctifs HTML et extraction audio."""
 import base64
 import re
+from pathlib import Path
 
 from h2m.scripts_js import GENERIC_AUDIO_CAPTURE
 
@@ -68,6 +69,17 @@ def _is_gsapvideo(text):
     )
 
 
+def _is_aistudio(text):
+    # Pages « vidéo canvas » exportées d'AI Studio : renderFrame(t) pur piloté par
+    # une boucle requestAnimationFrame, canvas plein cadre et <audio> fourni à côté
+    # du HTML (fichier relatif, pas en base64).
+    return (
+        bool(re.search(r"\bfunction\s+renderFrame\s*\(", text))
+        and bool(re.search(r"requestAnimationFrame\s*\(\s*loop\s*\)", text))
+        and bool(re.search(r"<canvas\b", text, re.I))
+    )
+
+
 # Table des profils reconnus, testés dans l'ordre. Pour en ajouter un : écrire son test
 # _is_xxx(text), l'inscrire ici, puis prévoir son correctif dans patch_html et son audio
 # dans extract_audio / render.
@@ -77,6 +89,7 @@ PROFILES = (
     ("musicpro", "MusicPro (canvas + voix et musique Web Audio)", _is_musicpro),
     ("voicevideo", "Vidéo React (audio intégré + window.__video)", _is_voicevideo),
     ("gsapvideo", "Vidéo GSAP synchronisée sur la piste audio", _is_gsapvideo),
+    ("aistudio", "AI Studio (canvas renderFrame + audio externe)", _is_aistudio),
 )
 PRECISE_PROFILES = tuple(name for name, _, _ in PROFILES)
 
@@ -132,6 +145,31 @@ def patch_html(text):
         m = re.search(r"<head\b[^>]*>", text, flags=re.I)
         text = text[:m.end()] + manual + text[m.end():] if m else manual + text
         return text, "gsapvideo"
+    if profile == "aistudio":
+        # 1. Expose renderFrame (déclaration hoistée dans l'IIFE) pour le rendu image par image.
+        text = re.sub(r"function\s+renderFrame\s*\(",
+                      lambda m: "window.__renderFrame=renderFrame;" + m.group(0), text, count=1)
+        # 2. La boucle rAF ne doit plus avancer currentTime pendant le rendu manuel.
+        text = re.sub(r"function\s+loop\s*\(\s*now\s*\)\s*\{",
+                      lambda m: m.group(0) + "if(window.__manual)return;", text, count=1)
+        # 3. Cadrage exact : la scène remplace le cadre de démonstration (94vh, coins
+        #    arrondis, bouton de lecture) et occupe exactement W×H pixels — le viewport
+        #    de rendu est plus haut (H+300), 100vh l'étirerait.
+        w, h = detect_stage_size(text)
+        fixed_css = (
+            "<script>window.__manual=true</script>\n"
+            "<style>/* RENDRAX : cadre vidéo exact */\n"
+            f".stage-wrap{{position:fixed!important;left:0!important;top:0!important;"
+            f"width:{w}px!important;height:{h}px!important;max-height:none!important;"
+            f"aspect-ratio:auto!important;margin:0!important;border-radius:0!important;"
+            f"box-shadow:none!important}}\n"
+            "#playBtn{display:none!important}\n"
+            "html,body{overflow:hidden!important}\n"
+            "</style>"
+        )
+        m = re.search(r"<head\b[^>]*>", text, flags=re.I)
+        text = text[:m.end()] + fixed_css + text[m.end():] if m else fixed_css + text
+        return text, "aistudio"
     return text, ""
 
 
@@ -140,14 +178,44 @@ def editpro_duration(text):
     return float(m.group(1)) if m else 60.0
 
 
+def aistudio_duration(text):
+    """Durée déclarée d'une page AI Studio : DEFAULT_DURATION = 61.0 ;</...
+
+    sans base ni page de substitution : la constante du script."""
+    m = re.search(r"\bDEFAULT_DURATION\s*=\s*(\d+(?:\.\d+)?)", text)
+    return float(m.group(1)) if m else 60.0
+
+
 MIME_EXT = {"mpeg": "mp3", "mp3": "mp3", "wav": "wav", "x-wav": "wav", "ogg": "ogg", "mp4": "m4a", "aac": "aac", "webm": "webm"}
 
 
-def extract_audio(text, tmp, profile="kidas"):
+def extract_audio(text, tmp, profile="kidas", asset_root=None):
     """Retourne {'voice': Path|None, 'music': Path|None, 'music_volume': float}."""
     out = {"voice": None, "music": None, "music_volume": 0.2}
     if profile == "musicpro":
         return out  # pistes décodées par le navigateur : voir window.__wavOf
+    if profile == "aistudio":
+        # L'audio est un fichier fourni à côté du HTML (audio.mp3 dans le ZIP / dossier
+        # source), pas une data URI. On le lit depuis la racine des ressources via le
+        # serveur HTTP local : même origine, aucune copie côté Python.
+        if asset_root is None:
+            return out
+        for tag in re.finditer(r"<audio\b[^>]*\bsrc=[\"']([^\"']+)[\"'][^>]*>", text, re.I):
+            raw = tag.group(1).strip()
+            if re.match(r"^(?:[a-z][a-z0-9+.-]*:|//|#)", raw, re.I):
+                continue  # http(s), data:, blob:, ancre : pas un fichier relatif
+            rel = re.sub(r"^[./]+", "", raw.split("?", 1)[0].split("#", 1)[0])
+            if not re.fullmatch(r"[\w./ -]{1,160}", rel):
+                continue
+            candidate = (asset_root / rel).resolve()
+            try:
+                candidate.relative_to(Path(asset_root).resolve())
+            except ValueError:
+                continue  # chemin sortant de la racine : refusé
+            if candidate.is_file():
+                out["voice"] = candidate
+                break
+        return out
     if profile == "editpro":
         m = re.search(r'"voice"\s*:\s*"([A-Za-z0-9+/=]+)"', text)
         if m:
@@ -179,6 +247,9 @@ def extract_audio(text, tmp, profile="kidas"):
 def detect_stage_size(text):
     m = re.search(r"[.#](?:stage|st)\s*\{[^}]*?width:\s*(\d+)px;\s*height:\s*(\d+)px", text)
     if m:
+        return int(m.group(1)), int(m.group(2))
+    m = re.search(r"<canvas\b[^>]*\bwidth\s*=\s*[\"']?(\d{3,4})[\"']?[^>]*\bheight\s*=\s*[\"']?(\d{3,4})[\"']?", text, re.I)
+    if m:  # AI Studio : canvas plein cadre
         return int(m.group(1)), int(m.group(2))
     m = re.search(r"\bW\s*=\s*(\d{3,4})\s*,\s*H\s*=\s*(\d{3,4})\b", text)  # const W = 1080, H = 1920
     return (int(m.group(1)), int(m.group(2))) if m else (1080, 1920)

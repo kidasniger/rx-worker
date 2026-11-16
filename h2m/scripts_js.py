@@ -30,6 +30,20 @@ window.__seek = async (t) => {
     await window.__finish();
     return 1;
   }
+  if (window.__profile === 'aistudio') {
+    window.__manual = true;
+    const time = Math.max(0, Number(t) || 0);
+    // Pilotage direct : la boucle rAF de la page est neutralisée par patch_html,
+    // __seek appelle renderFrame(t) comme le ferait la lecture réelle.
+    if (typeof renderFrame === 'function') renderFrame(time);
+    else if (typeof window.__renderFrame === 'function') window.__renderFrame(time);
+    // Masque le bouton de lecture (et l'écran de démarrage éventuel) : ils ne
+    // font pas partie de la vidéo.
+    const play = document.querySelector('#playBtn'); if (play) play.style.display = 'none';
+    const canvas = document.querySelector('canvas'); if (canvas) canvas.style.cursor = 'default';
+    await window.__finish();
+    return 1;
+  }
   if (window.__profile === 'gsapvideo') {
     window.__manual = true;
     const time = Math.max(0, Number(t) || 0);
