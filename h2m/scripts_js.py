@@ -30,20 +30,6 @@ window.__seek = async (t) => {
     await window.__finish();
     return 1;
   }
-  if (window.__profile === 'aistudio') {
-    window.__manual = true;
-    const time = Math.max(0, Number(t) || 0);
-    // Pilotage direct : la boucle rAF de la page est neutralisée par patch_html,
-    // __seek appelle renderFrame(t) comme le ferait la lecture réelle.
-    if (typeof renderFrame === 'function') renderFrame(time);
-    else if (typeof window.__renderFrame === 'function') window.__renderFrame(time);
-    // Masque le bouton de lecture (et l'écran de démarrage éventuel) : ils ne
-    // font pas partie de la vidéo.
-    const play = document.querySelector('#playBtn'); if (play) play.style.display = 'none';
-    const canvas = document.querySelector('canvas'); if (canvas) canvas.style.cursor = 'default';
-    await window.__finish();
-    return 1;
-  }
   if (window.__profile === 'gsapvideo') {
     window.__manual = true;
     const time = Math.max(0, Number(t) || 0);
@@ -171,6 +157,62 @@ window.__wavOf = async (key) => {
 };
 0;
 """
+
+
+# Pont injecté DANS la fermeture de la page « canvas + voix » (profil rendraxai), juste avant son
+# démarrage : il donne accès à ses variables privées sans modifier le fichier de l'utilisateur.
+RENDRAXAI_BRIDGE = r"""/* RENDRAX : pont de rendu image par image (injecté au rendu, fichier d'origine intact) */
+window.__rendraxSeek = (t) => {
+  currentTime = Math.max(0, Number(t) || 0);
+  isPlaying = false;
+  renderFrame(currentTime);
+};
+window.__rendraxReady = () => {
+  try { return !!(hasExternalPhoto || (externalPhoto.complete && externalPhoto.naturalWidth === 0)); }
+  catch (e) { return true; }
+};
+window.__rendraxDuration = () => {
+  const d = voiceAudio.duration;
+  return Math.max(totalDuration, (Number.isFinite(d) && d > 0) ? d : 0);
+};
+window.__rendraxSfx = async (total) => {
+  const sr = 44100;
+  const oc = new OfflineAudioContext(1, Math.ceil((Number(total) + 2) * sr), sr);
+  let T = 0;
+  Object.defineProperty(oc, 'currentTime', { get: () => T });
+  const keep = { c: sfxCtx, n: noiseBuf, s: lastSfxStep, p: isPlaying };
+  try {
+    sfxCtx = oc;
+    const len = Math.floor(sr * 1.2);
+    noiseBuf = oc.createBuffer(1, len, sr);
+    const nd = noiseBuf.getChannelData(0);
+    let seed = 20070629;
+    for (let i = 0; i < len; i++) { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; nd[i] = seed / 2147483648 - 1; }
+    isPlaying = true; lastSfxStep = -1;
+    // Même grille que la lecture réelle : un déclenchement par pas de 200 ms, au premier instant du pas.
+    const steps = Math.floor(Number(total) * 5);
+    for (let k = 0; k <= steps; k++) { T = k / 5 + 0.008; triggerCinematicSfx(T); }
+  } finally {
+    sfxCtx = keep.c; noiseBuf = keep.n; lastSfxStep = keep.s; isPlaying = keep.p;
+  }
+  const buf = await oc.startRendering();
+  const x = buf.getChannelData(0), pcm = new Int16Array(x.length);
+  for (let i = 0; i < x.length; i++) { const v = Math.max(-1, Math.min(1, x[i])); pcm[i] = v < 0 ? v * 32768 : v * 32767; }
+  const u8 = new Uint8Array(pcm.buffer);
+  let bin = '';
+  for (let i = 0; i < u8.length; i += 0x8000) bin += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+  return btoa(bin);
+};
+"""
+
+# Scène fixée à 1080×1920 px en haut à gauche, sans bouton ▶, bords arrondis ni ombre.
+RENDRAXAI_STAGE_CSS = (
+    "html,body{margin:0!important;padding:0!important;background:#000!important;display:block!important;overflow:hidden!important}"
+    ".stage-wrap{position:fixed!important;left:0!important;top:0!important;width:1080px!important;height:1920px!important;"
+    "max-height:none!important;aspect-ratio:auto!important;border-radius:0!important;box-shadow:none!important;transform:none!important}"
+    "#canvas{width:1080px!important;height:1920px!important}"
+    "#playBtn{display:none!important}"
+)
 
 
 GENERIC_AUDIO_CAPTURE = r"""<script>

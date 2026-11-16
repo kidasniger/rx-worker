@@ -14,9 +14,8 @@ from h2m.browser import (BrowserStartupError, CDP, launch_chrome, page_ws_url,
 from h2m.deps import IS_TERMUX, find_chrome
 from h2m.encode import (QUALITY, check_audio_level, output_path, start_encoder, unique_path, verify_sync,
                         write_wav, write_wav_payload)
-from h2m.profiles import (PRECISE_PROFILES, aistudio_duration, choose_frame_size, detect_profile,
-                          editpro_duration, extract_audio, inject_base_url,
-                          inject_generic_audio_capture, patch_html)
+from h2m.profiles import (PRECISE_PROFILES, choose_frame_size, detect_profile, editpro_duration, extract_audio,
+                          inject_base_url, inject_generic_audio_capture, patch_html)
 from h2m.report import print_report
 from h2m.scripts_js import JS_HELPERS
 from h2m.sync import calculate_audio_offset_ms, first_audio_onset, visual_change
@@ -76,7 +75,11 @@ def render(html_path, args):
             raise ValueError("Le décalage audio doit être un entier compris entre -2000 et 2000 ms.")
         if audio_offset_ms:
             info(f"Décalage audio manuel appliqué au mixage final : {audio_offset_ms:+d} ms.")
-        text, profile = patch_html(text)
+        text, patched_profile = patch_html(text)
+        if profile in PRECISE_PROFILES and not patched_profile:
+            warn("Structure de la page inattendue pour le mode synchronisé : retour au mode universel (temps réel).")
+            label = "Page HTML générique (repli du mode synchronisé)"
+        profile = patched_profile
         precise_candidate = profile in PRECISE_PROFILES
         W, H = choose_frame_size(text, "auto" if precise_candidate else args.format)
         page = tmp / "page.html"
@@ -92,7 +95,9 @@ def render(html_path, args):
         http_server = start_local_http_server(asset_root, entry_file=page)
         text = inject_base_url(text, http_server.base_url_for(relative_parent))
         page.write_text(text, encoding="utf-8")
-        audio = extract_audio(text, tmp, profile, asset_root=asset_root) if precise_candidate else {"voice": None, "music": None, "music_volume": 0.2}
+        base_dir = asset_root / relative_parent if relative_parent else asset_root
+        audio = (extract_audio(text, tmp, profile, base_dir=base_dir, root=asset_root) if precise_candidate
+                 else {"voice": None, "music": None, "music_volume": 0.2})
         info(f"Fenêtre {W}×{H} · mode : {'image par image (synchronisé)' if precise_candidate else 'universel (temps réel, synchro non garantie)'}")
 
         chrome = find_chrome()
@@ -135,8 +140,8 @@ def render(html_path, args):
                 check = "(()=>!!document.querySelector('#st')&&typeof render==='function'&&typeof D==='number'&&typeof vP!=='undefined'&&typeof mP!=='undefined')()"
             elif profile == "gsapvideo":
                 check = "(()=>!!document.querySelector('#st')&&!!document.querySelector('#a')&&typeof gsap!=='undefined'&&typeof tl!=='undefined'&&typeof SUB!=='undefined')()"
-            elif profile == "aistudio":
-                check = "(()=>{const f=window.__renderFrame||null;return !!document.querySelector('canvas')&&typeof f==='function'})()"
+            elif profile == "rendraxai":
+                check = "(()=>!!document.querySelector('#canvas')&&typeof window.__rendraxSeek==='function'&&typeof window.__rendraxSfx==='function'&&document.querySelectorAll('audio').length>=1)()"
             else:
                 check = "(()=>!!document.querySelector('#stage')&&typeof render==='function'&&typeof IM==='object')()"
             t1 = time.time()
@@ -159,6 +164,19 @@ def render(html_path, args):
             cdp.ev(f"window.__profile = {json.dumps(profile)}; 0", await_promise=False)
             cdp.ev(JS_HELPERS, await_promise=False)
             cdp.ev("window.__prep()")
+            if profile == "rendraxai":
+                # Les images liées (photo, portrait) doivent être chargées avant la première capture.
+                t_ready = time.time()
+                while time.time() - t_ready < 15:
+                    try:
+                        if cdp.ev("window.__rendraxReady()", await_promise=False):
+                            break
+                    except RuntimeError as exc:
+                        if _is_browser_failure(exc):
+                            raise
+                    time.sleep(0.25)
+                else:
+                    warn("Les images de la page ne sont pas toutes chargées après 15 s : rendu avec le contenu disponible.")
             if profile in ("kidas", "musicpro"):
                 total = float(cdp.ev("D"))
             elif profile == "voicevideo":
@@ -166,17 +184,9 @@ def render(html_path, args):
             elif profile == "gsapvideo":
                 # The embedded narration is the master clock for the original GSAP timeline.
                 total = float(cdp.ev("document.querySelector('#a').duration"))
-            elif profile == "aistudio":
-                # Narration fournie à côté du HTML : c'est l'horloge maîtresse de la page
-                # (totalDuration = max(DEFAULT_DURATION, durée audio) côté script d'origine).
-                try:
-                    audio_dur = float(cdp.ev(
-                        "(()=>{const a=[...document.querySelectorAll('audio')].filter(x=>x.duration&&isFinite(x.duration));"
-                        "return a.length?Math.max(...a.map(x=>x.duration)):0})()"))
-                except RuntimeError:
-                    audio_dur = 0.0
-                declared = aistudio_duration(text)
-                total = max(declared, audio_dur) if audio_dur > 0 else declared
+            elif profile == "rendraxai":
+                # Même règle que la page : le plus grand de la durée par défaut et de celle de la voix.
+                total = float(cdp.ev("window.__rendraxDuration()", await_promise=False))
             else:
                 total = editpro_duration(text)
             dur = min(total, args.duration) if args.duration > 0 else total
@@ -187,6 +197,9 @@ def render(html_path, args):
             n_frames = max(1, int(round(dur * fps)))
             info(f"Mode synchronisé · {label} · durée {dur:.2f} s · {fps} i/s")
 
+            if profile == "rendraxai" and not audio["voice"]:
+                die("La piste voix de la page est introuvable. Envoie un ZIP contenant la page HTML "
+                    "et son fichier audio (par exemple audio.mp3) au même endroit que dans ton dossier.")
             audio_inputs = []
             if audio["voice"]:
                 audio_inputs.append((audio["voice"], 1.0))
@@ -195,6 +208,17 @@ def render(html_path, args):
             if profile == "kidas":
                 try:
                     b64 = cdp.ev("window.__sfx()")
+                    if b64:
+                        info("Effets sonores recréés.")
+                        sfx = tmp / "sfx.wav"
+                        write_wav(sfx, base64.b64decode(b64))
+                        audio_inputs.append((sfx, 1.0))
+                except Exception as e:  # noqa: BLE001
+                    warn(f"Effets sonores ignorés : {e}")
+            if profile == "rendraxai":
+                # Effets Web Audio de la page rejoués hors-ligne sur la même grille de 200 ms.
+                try:
+                    b64 = cdp.ev(f"window.__rendraxSfx({dur:.3f})")
                     if b64:
                         info("Effets sonores recréés.")
                         sfx = tmp / "sfx.wav"
@@ -218,15 +242,11 @@ def render(html_path, args):
                         info(f"Piste {label_fr} récupérée depuis le navigateur.")
                     else:
                         warn(f"Piste {label_fr} introuvable ou non décodée par le navigateur.")
-            if not audio_inputs and profile != "aistudio":
+            if not audio_inputs:
                 die("Aucune piste audio valide n’a été récupérée pour ce profil synchronisé. Le MP4 muet a été bloqué.")
-            if not audio_inputs and profile == "aistudio":
-                warn("Audio externe introuvable (audio.mp3 fourni à côté du HTML ?) : la vidéo sera muette. "
-                     "Regroupe le HTML et l'audio dans un ZIP pour obtenir le son.")
 
             cdp.ev("window.__seek(0)")
-            scene_selector = ".stage-wrap, .stage, #stage, #st" if profile == "aistudio" else ".stage,#stage,#st"
-            r = cdp.ev(f"(()=>{{const r=document.querySelector('{scene_selector}').getBoundingClientRect();return [r.x,r.y,r.width,r.height]}})()")
+            r = cdp.ev("(()=>{const r=document.querySelector('.stage,#stage,#st,.stage-wrap').getBoundingClientRect();return [r.x,r.y,r.width,r.height]})()")
             if abs(r[2] - W) > 2 or abs(r[3] - H) > 2:
                 warn(f"La scène mesure {r[2]:.0f}×{r[3]:.0f} au lieu de {W}×{H} : rendu possiblement flou.")
             clip = {"x": round(r[0]), "y": round(r[1]), "width": W, "height": H, "scale": args.scale}
