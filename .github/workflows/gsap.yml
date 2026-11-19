@@ -1,0 +1,30 @@
+name: Animation (scènes IA)
+run-name: Animation ${{ inputs.job_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: "Identifiant de la création (rempli par la page web)"
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  animation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Écrire les scènes
+        env:
+          JOB_ID: ${{ inputs.job_id }}
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+        run: python gsap.py
