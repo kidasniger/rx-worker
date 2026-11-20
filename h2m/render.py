@@ -155,6 +155,11 @@ def render(html_path, args):
                 if not is_precise:
                     time.sleep(0.5)
             if not is_precise:
+                try:
+                    etat = cdp.ev("(()=>{let syn='ok';try{new Function([...document.scripts].filter(x=>!x.src).map(x=>x.textContent).join('\\n'))}catch(e){syn=String(e.message)}return JSON.stringify({gsap:typeof gsap,tl:typeof tl,SUB:typeof SUB,st:!!document.querySelector('#st'),audio:!!document.querySelector('#a'),syntaxe:syn})})()", await_promise=False)
+                    warn("État de la page : " + str(etat)[:400])
+                except Exception as exc:
+                    warn("État de la page illisible : " + str(exc)[:150])
                 raise BrowserStartupError(
                     f"Fichier reconnu ({label}) mais la page ne s'est pas initialisée : "
                     "Internet est-il disponible pour charger React et les polices ?"
