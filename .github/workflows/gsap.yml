@@ -27,4 +27,6 @@ jobs:
         env:
           JOB_ID: ${{ inputs.job_id }}
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          DEBUG_LOGS: ${{ vars.GSAP_DEBUG }}
+          PYTHONUNBUFFERED: "1"
         run: python gsap.py
