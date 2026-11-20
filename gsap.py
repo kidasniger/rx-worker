@@ -10,6 +10,7 @@ import re
 import socket
 import sys
 import time
+from collections import Counter
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -35,6 +36,34 @@ if not KEY:
 
 def log(message):
     print(message, flush=True)
+
+
+class Boucle(RuntimeError):
+    pass
+
+
+class Garde:
+    """Coupe la réponse si le modèle boucle (même ligne répétée) ou s'éternise."""
+
+    def __init__(self):
+        self.reste = ""
+        self.vues = Counter()
+        self.total = 0
+
+    def verifier(self, texte, debut):
+        self.total += len(texte)
+        if time.time() - debut > 90:
+            raise Boucle("réponse trop longue (90 s)")
+        if self.total > 5000:
+            raise Boucle("réponse trop volumineuse")
+        self.reste += texte
+        while "\n" in self.reste:
+            ligne, self.reste = self.reste.split("\n", 1)
+            cle = re.sub(r"[0-9.]+", "#", ligne.strip())
+            if len(cle) >= 40:
+                self.vues[cle] += 1
+                if self.vues[cle] >= 5:
+                    raise Boucle("répétition détectée")
 
 
 class Lignes:
@@ -104,6 +133,7 @@ def lire_flux(reponse, debut):
     premier = None
     mode = None
     usage = None
+    garde = Garde()
     pensee_log = Lignes("    ~ ")
     code_log = Lignes("    | ")
     if DEBUG:
@@ -136,6 +166,7 @@ def lire_flux(reponse, debut):
                 pensee_log.ajouter(pensee)
             if texte:
                 contenu.append(texte)
+                garde.verifier(texte, debut)
                 if DEBUG:
                     if mode != "c":
                         pensee_log.fin()
@@ -160,7 +191,7 @@ def ecrire(systeme, utilisateur):
             {"role": "user", "content": utilisateur},
         ],
         "temperature": 0.4,
-        "max_tokens": 8000,
+        "max_tokens": 1500,
         "stream": True,
     }
     if THINKING in ("enabled", "disabled"):
@@ -172,6 +203,7 @@ def ecrire(systeme, utilisateur):
     }
     for essai in range(1, ESSAIS_API + 1):
         debut = time.time()
+        corps["temperature"] = 0.4 if essai == 1 else 0.8
         requete = urllib.request.Request(
             ZAI_URL, data=json.dumps(corps).encode("utf-8"), headers=entetes, method="POST")
         try:
@@ -181,6 +213,9 @@ def ecrire(systeme, utilisateur):
             if not texte.strip():
                 raise RuntimeError("réponse vide")
             return texte
+        except Boucle as erreur:
+            log("  boucle détectée (%s), nouvel essai avec plus de variété" % erreur)
+            continue
         except urllib.error.HTTPError as erreur:
             statut = erreur.code
             if DEBUG:
