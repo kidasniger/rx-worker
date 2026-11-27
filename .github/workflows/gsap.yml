@@ -7,6 +7,10 @@ on:
       job_id:
         description: "Identifiant de la création (rempli par la page web)"
         required: true
+      model_retry:
+        description: "Modèle de renfort pour les tentatives 2+ (vide = variable de dépôt ZAI_MODEL_RETRY, sinon le modèle principal)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -27,6 +31,9 @@ jobs:
         env:
           JOB_ID: ${{ inputs.job_id }}
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          # Renfort : une scène refusée deux fois est réécrite par un modèle
+          # plus fort (variable de dépôt ZAI_MODEL_RETRY, surchargeable ici).
+          ZAI_MODEL_RETRY: ${{ inputs.model_retry || vars.ZAI_MODEL_RETRY }}
           DEBUG_LOGS: ${{ vars.GSAP_DEBUG }}
           PYTHONUNBUFFERED: "1"
         run: python gsap.py

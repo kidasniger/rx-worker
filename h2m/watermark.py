@@ -1,4 +1,8 @@
-"""Ajout d'un filigrane RENDRAX animé au MP4 final, sans modifier le HTML."""
+"""Ajout d'un filigrane RENDRAX animé au MP4 final, sans modifier le HTML.
+
+Rendu discret par défaut : opacité réduite, taille contenue et entrée en fondu
+environ 1 seconde après le début de la vidéo (le logo ne masque plus l'ouverture).
+"""
 import json
 import math
 import shutil
@@ -14,7 +18,7 @@ DURATION_MS = 2000
 
 
 def validate_watermark(text="RENDRAX", animation="pulse", position="right-center",
-                       opacity=0.45, size=0.07):
+                       opacity=0.38, size=0.06):
     if not isinstance(text, str) or not text.strip() or len(text) > 80:
         raise ValueError("Le texte du filigrane doit contenir de 1 à 80 caractères.")
     if animation not in ANIMATIONS:
@@ -136,13 +140,20 @@ def _overlay_filter(position, animation, frame_width, frame_height):
         x, y = "(W-w)/2", "(H-h)/2"
     if animation == "float":
         y += "+sin(2*PI*t/4)*H*0.006"
-    return (f"[1:v]format=rgba,setpts=PTS-STARTPTS[wm];"
+    # Entrée discrète : fondu alpha qui démarre ~1 s après le début. L'APNG est
+    # bouclé via stream_loop : ses timestamps restent croissants, le fondu ne se
+    # déclenche donc qu'une seule fois, puis le logo reste à opacité constante.
+    return (f"[1:v]format=rgba,fade=t=in:st=1:d=0.8:alpha=1,setpts=PTS-STARTPTS[wm];"
             f"[0:v][wm]overlay=x='{x}':y='{y}':eval=frame:eof_action=repeat:shortest=1[v]")
 
 
 def apply_watermark(source, destination, text="RENDRAX", animation="pulse",
-                    position="right-center", opacity=0.45, size=0.07):
-    """Overlay an animated PNG; copy audio packets unchanged to preserve sync."""
+                    position="right-center", opacity=0.38, size=0.06):
+    """Overlay an animated PNG; copy audio packets unchanged to preserve sync.
+
+    Par défaut le filigrane est discret : opacité 0,38, hauteur ~6 % de l'image
+    et apparition en fondu après ~1 s (voir _overlay_filter).
+    """
     text, animation, position, opacity, size = validate_watermark(
         text, animation, position, opacity, size
     )

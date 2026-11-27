@@ -1,0 +1,51 @@
+name: Golden test (rendu gsapvideo)
+
+# Filet de régression hebdomadaire : la fixture golden passe dans un Chromium
+# réel avec les ponts de rendu et les primitives MD.*, le contrat gsapvideo est
+# vérifié, et tous les modules Python compilent. Échouer ici détecte une
+# régression du moteur AVANT qu'elle n'atteigne les vidéos des utilisateurs.
+on:
+  schedule:
+    - cron: "0 6 * * 1" # chaque lundi 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: golden-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Dépendances (websocket-client, Pillow, Chromium Playwright)
+        timeout-minutes: 8
+        run: |
+          python -m pip install --disable-pip-version-check --no-input websocket-client Pillow playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Compilation des modules Python
+        run: python -m compileall -q gsap.py tts.py html2mp4.py h2m scripts
+
+      - name: Contrat gsapvideo de la fixture golden
+        run: python tests/check_contrat.py tests/fixtures/golden_gsap.html
+
+      - name: Rendu Chromium (primitives MD, seek déterministe, capture)
+        run: python h2m/smoke_test.py --fixture tests/fixtures/golden_gsap.html
+
+      - name: Conserver la capture en cas d'échec
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-smoke
+          path: golden-smoke.png
+          if-no-files-found: ignore

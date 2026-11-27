@@ -1,4 +1,9 @@
-"""Scripts JavaScript injectés dans la page."""
+"""Scripts JavaScript injectés dans la page.
+
+Comprend les ponts de rendu (seek, capture audio) et les primitives motion
+design MD.* des vidéos gsapvideo : heroWord, accent, popIn, outSlide/outMask,
+transitions (rideau, iris, vague, flood, fondu2), compteurs, jauges, grain.
+"""
 
 
 
@@ -148,13 +153,389 @@ window.__wavOf = async (key) => {
   const ch = Math.min(2, buf.numberOfChannels), n = buf.length, pcm = new Int16Array(n * ch);
   for (let c = 0; c < ch; c++) {
     const x = buf.getChannelData(c);
-    for (let i = 0; i < n; i++) { const v = Math.max(-1, Math.min(1, x[i])); pcm[i * ch + c] = v < 0 ? v * 32768 : v * 32767; }
+    for (let i = 0; i < n; i++) { const s = Math.max(-1, Math.min(1, x[i])); pcm[i * ch + c] = s < 0 ? s * 32768 : s * 32767; }
   }
   const u8 = new Uint8Array(pcm.buffer);
   let bin = '';
   for (let i = 0; i < u8.length; i += 0x8000) bin += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
   return buf.sampleRate + ':' + ch + ':' + btoa(bin);
 };
+
+/* ===== Primitives motion design RENDRAX (MD.*) =====
+   Bibliothèque partagée des vidéos gsapvideo : chaque fonction AJOUTE des
+   tweens au timeline passé en argument (jamais de timeline parallèle), donc
+   tout reste déterministe au seek image par image. Toutes les fonctions sont
+   protégées : une primitive ne peut jamais interrompre un rendu. */
+(() => {
+  if (window.MD) return;
+  const $ = (sel) => (typeof sel === 'string' ? document.querySelector(sel) : (sel && sel.nodeType === 1 ? sel : null));
+  const num = (v, d) => (Number.isFinite(Number(v)) ? Number(v) : d);
+  const stageRoot = () => document.getElementById('st') || document.body;
+  const garde = (fn) => function () {
+    try { return fn.apply(null, arguments); }
+    catch (e) { try { console.warn('MD : ' + (e && e.message)); } catch (e2) {} }
+  };
+  const calque = (id, extra) => {
+    let n = document.getElementById(id);
+    if (!n) {
+      n = document.createElement('div');
+      n.id = id;
+      n.setAttribute('style', 'position:absolute;inset:0;pointer-events:none;z-index:32;display:none;' + (extra || ''));
+      stageRoot().appendChild(n);
+    }
+    return n;
+  };
+  const voit = (tl, n, mode, at0, apres) => {
+    tl.set(n, { display: mode }, Math.max(0, at0 - 0.02));
+    if (apres != null) tl.set(n, { display: 'none' }, at0 + apres);
+  };
+
+  // Grain (5,5 %) + vignette : posés une fois pour toute la vidéo, statiques,
+  // donc sûrs au seek. Donne la profondeur « film » sans coût au rendu.
+  const grainFX = garde(() => {
+    if (document.getElementById('md-grain')) return true;
+    const g = document.createElement('div');
+    g.id = 'md-grain';
+    g.setAttribute('style', 'position:absolute;inset:0;pointer-events:none;z-index:34;opacity:.055;mix-blend-mode:overlay;'
+      + 'background-image:url("data:image/svg+xml,%3Csvg xmlns=\'http://www.w3.org/2000/svg\' width=\'140\' height=\'140\'%3E%3Cfilter id=\'n\'%3E%3CfeTurbulence type=\'fractalNoise\' baseFrequency=\'0.85\' numOctaves=\'2\' stitchTiles=\'stitch\'/%3E%3C/filter%3E%3Crect width=\'140\' height=\'140\' filter=\'url(%23n)\'/%3E%3C/svg%3E");');
+    const v = document.createElement('div');
+    v.id = 'md-vignette';
+    v.setAttribute('style', 'position:absolute;inset:0;pointer-events:none;z-index:35;'
+      + 'background:radial-gradient(ellipse at center, rgba(0,0,0,0) 60%, rgba(0,0,0,.24) 100%);');
+    const hote = stageRoot();
+    hote.appendChild(g);
+    hote.appendChild(v);
+    return true;
+  });
+
+  // Coupe un texte en caractères animables (spans inline-block).
+  const splitChars = garde((sel) => {
+    const elx = $(sel);
+    if (!elx) return [];
+    if (elx.dataset.mdSplit === '1') return Array.prototype.slice.call(elx.querySelectorAll('span.ch'));
+    const texte = elx.textContent || '';
+    elx.textContent = '';
+    const out = [];
+    for (const ch of texte) {
+      const s = document.createElement('span');
+      s.className = 'ch';
+      s.style.display = 'inline-block';
+      s.style.willChange = 'transform, opacity';
+      if (ch === ' ') { s.style.width = '.26em'; } else { s.textContent = ch; }
+      elx.appendChild(s);
+      out.push(s);
+    }
+    elx.dataset.mdSplit = '1';
+    return out;
+  });
+
+  // Mot héro : >= 170px, entrée masquée caractère par caractère, puis
+  // graisse 800 -> 400 et interlettrage 0.18em -> 0.04em (moment signature).
+  const heroWord = garde((tl, sel, o) => {
+    o = o || {};
+    const elx = $(sel);
+    if (!elx || !tl) return;
+    const taille = Math.max(170, num(o.size, 180));
+    elx.style.fontSize = taille + 'px';
+    elx.style.fontWeight = '800';
+    const chars = splitChars(elx);
+    if (!chars.length) return;
+    const at0 = num(o.at, 0);
+    const dur = num(o.dur, 0.7);
+    const from = o.from === 'up' ? -120 : 120;
+    tl.fromTo(chars, { yPercent: from, opacity: 0 },
+      { yPercent: 0, opacity: 1, duration: dur * 0.75, ease: o.easing || 'power4.out',
+        stagger: { each: (dur * 0.6) / Math.max(1, chars.length), from: o.staggerFrom || 'start' } }, at0);
+    tl.fromTo(elx, { letterSpacing: '0.18em' }, { letterSpacing: '0.04em', fontWeight: 400, duration: dur, ease: 'power2.out' }, at0 + dur * 0.8);
+    return elx;
+  });
+
+  // Surligneur : balayage d'un fond derrière le mot accentué (ancré at(i,"mot")).
+  const accent = garde((tl, sel, o) => {
+    o = o || {};
+    const elx = $(sel);
+    if (!elx || !tl) return;
+    const color = o.color || 'rgba(255,197,49,.45)';
+    elx.style.backgroundImage = 'linear-gradient(' + color + ',' + color + ')';
+    elx.style.backgroundRepeat = 'no-repeat';
+    elx.style.backgroundPosition = '0 72%';
+    elx.style.backgroundSize = '0% 56%';
+    tl.to(elx, { backgroundSize: '108% 56%', duration: num(o.dur, 0.45), ease: 'power2.inOut' }, num(o.at, 0));
+    return elx;
+  });
+
+  // Révélation de ligne par masque (clip-path) avec dérive latérale.
+  const maskLine = garde((tl, sel, o) => {
+    o = o || {};
+    const elx = $(sel);
+    if (!elx || !tl) return;
+    tl.fromTo(elx, { clipPath: 'inset(0% 100% 0% 0%)', x: -18 },
+      { clipPath: 'inset(0% 0% 0% 0%)', x: 0, duration: num(o.dur, 0.5), ease: 'power3.out' }, num(o.at, 0));
+    return elx;
+  });
+
+  // Entrée en profondeur (Z) : scale 1,15 + flou 10px -> net.
+  const popIn = garde((tl, sel, o) => {
+    o = o || {};
+    const elx = $(sel);
+    if (!elx || !tl) return;
+    tl.fromTo(elx, { opacity: 0, scale: 1.15, filter: 'blur(10px)' },
+      { opacity: 1, scale: 1, filter: 'blur(0px)', duration: num(o.dur, 0.5),
+        ease: o.easing || 'power3.out', overwrite: 'auto' }, num(o.at, 0));
+    return elx;
+  });
+
+  // Sortie anticipée : mini-anticipation (contremouvement) puis glissement hors champ.
+  const outSlide = garde((tl, sel, o) => {
+    o = o || {};
+    const elx = $(sel);
+    if (!elx || !tl) return;
+    const at0 = num(o.at, 0);
+    const dir = o.dir === 'r' ? 1 : -1;
+    tl.to(elx, { x: -dir * 22, duration: 0.09, ease: 'power1.in', overwrite: 'auto' }, at0);
+    tl.to(elx, { x: dir * 1400, opacity: 0, duration: num(o.dur, 0.45), ease: 'power3.in' }, at0 + 0.09);
+    return elx;
+  });
+
+  // Sortie par masque : la scène se « referme » sur l'élément (jamais de coupure sèche).
+  const outMask = garde((tl, sel, o) => {
+    o = o || {};
+    const elx = $(sel);
+    if (!elx || !tl) return;
+    const at0 = num(o.at, 0);
+    const up = o.dir !== 'down';
+    tl.fromTo(elx, { clipPath: 'inset(0% 0% 0% 0%)' },
+      { clipPath: up ? 'inset(0% 0% 100% 0%)' : 'inset(100% 0% 0% 0%)',
+        y: up ? -46 : 46, duration: num(o.dur, 0.4), ease: 'power3.in' }, at0);
+    return elx;
+  });
+
+  // Dérive caméra : très lent zoom de respiration (1,035 -> 1) sur la scène.
+  const driftCam = garde((tl, o) => {
+    o = o || {};
+    const st = document.getElementById('st');
+    if (!st || !tl) return;
+    tl.fromTo(st, { scale: num(o.from, 1.035) },
+      { scale: 1, duration: num(o.dur, 6), ease: 'none', overwrite: 'auto' }, num(o.at, 0));
+    return st;
+  });
+
+  // Ken Burns : zoom lent + dérive diagonale sur une image.
+  const kenBurns = garde((tl, sel, o) => {
+    o = o || {};
+    const elx = $(sel);
+    if (!elx || !tl) return;
+    tl.fromTo(elx, { scale: 1, x: 0, y: 0 },
+      { scale: num(o.zoom, 1.12), x: num(o.dx, -20), y: num(o.dy, -14),
+        duration: num(o.dur, 6), ease: 'none', overwrite: 'auto' }, num(o.at, 0));
+    return elx;
+  });
+
+  // Parallaxe : dérive continue d'une couche pendant les temps morts.
+  const parallax = garde((tl, sel, o) => {
+    o = o || {};
+    const elx = $(sel);
+    if (!elx || !tl) return;
+    tl.to(elx, { y: -num(o.depth, 40), duration: num(o.dur, 4), ease: 'none', overwrite: 'auto' }, num(o.at, 0));
+    return elx;
+  });
+
+  // Compteur avec pop du suffixe (%, +, €) à la fin du décompte.
+  const countTo = garde((tl, sel, o) => {
+    o = o || {};
+    const elx = $(sel);
+    if (!elx || !tl) return;
+    const dec = Math.max(0, Math.min(2, num(o.decimals, 0)));
+    const suffix = o.suffix == null ? '' : String(o.suffix);
+    const fmt = (v) => {
+      let s = Number(v).toFixed(dec);
+      if (!dec && o.groupes !== false) s = s.replace(/\B(?=(\d{3})+(?!\d))/g, '\u00a0');
+      return s + suffix;
+    };
+    const etat = { v: num(o.from, 0) };
+    elx.textContent = fmt(etat.v);
+    const at0 = num(o.at, 0);
+    const dur = num(o.dur, 1.2);
+    tl.to(etat, { v: num(o.to, 100), duration: dur, ease: o.easing || 'power2.out',
+      onUpdate: () => { try { elx.textContent = fmt(etat.v); } catch (e) {} } }, at0);
+    tl.fromTo(elx, { scale: 1.14 }, { scale: 1, duration: 0.3, ease: 'back.out(2.5)', overwrite: 'auto' }, at0 + dur + 0.02);
+    return elx;
+  });
+
+  // Barre de progression : scaleX de 0 au pourcentage demandé.
+  const bar = garde((tl, sel, o) => {
+    o = o || {};
+    const elx = $(sel);
+    if (!elx || !tl) return;
+    elx.style.transformOrigin = '0% 50%';
+    tl.fromTo(elx, { scaleX: 0 }, { scaleX: Math.max(0, Math.min(1, num(o.pct, 80) / 100)),
+      duration: num(o.dur, 1), ease: o.easing || 'power2.out', overwrite: 'auto' }, num(o.at, 0));
+    return elx;
+  });
+
+  // Anneau SVG de progression (premier <circle> du sélecteur), rotation -90°.
+  const ring = garde((tl, sel, o) => {
+    o = o || {};
+    const hote = $(sel);
+    if (!hote || !tl) return;
+    const c = hote.nodeType === 1 && hote.tagName === 'circle' ? hote : hote.querySelector('circle');
+    if (!c) return;
+    const r = parseFloat(c.getAttribute('r')) || 50;
+    const C = 2 * Math.PI * r;
+    c.style.strokeDasharray = String(C);
+    c.style.transformOrigin = '50% 50%';
+    c.style.transform = 'rotate(-90deg)';
+    tl.fromTo(c, { strokeDashoffset: C },
+      { strokeDashoffset: C * (1 - Math.max(0, Math.min(1, num(o.pct, 75) / 100))),
+        duration: num(o.dur, 1.2), ease: o.easing || 'power2.inOut', overwrite: 'auto' }, num(o.at, 0));
+    return c;
+  });
+
+  // Tracé SVG animé (stroke-dashoffset), pour pictos et soulignements dessinés.
+  const drawPath = garde((tl, sel, o) => {
+    o = o || {};
+    const p = $(sel);
+    if (!p || !tl || !p.getTotalLength) return;
+    const L = p.getTotalLength();
+    if (!L) return;
+    p.style.strokeDasharray = String(L);
+    tl.fromTo(p, { strokeDashoffset: L }, { strokeDashoffset: 0,
+      duration: num(o.dur, 1), ease: o.easing || 'power2.inOut', overwrite: 'auto' }, num(o.at, 0));
+    return p;
+  });
+
+  // Impact : éclair plein écran 80 ms (un seul par scène, sur le mot fort).
+  const flash = garde((tl, o) => {
+    o = o || {};
+    const n = calque('md-flash', 'background:#ffffff;');
+    if (!tl) return;
+    const at0 = num(o.at, 0);
+    voit(tl, n, 'block', at0, 0.25);
+    tl.fromTo(n, { opacity: 0 }, { opacity: Math.max(0.2, Math.min(1, num(o.force, 0.85))), duration: 0.05, ease: 'none' }, at0);
+    tl.to(n, { opacity: 0, duration: num(o.dur, 0.12), ease: 'power2.out' }, at0 + 0.05);
+    return n;
+  });
+
+  // Rideau N colonnes : mode 'close' (couvre) puis 'open' (révèle) à la frontière de scène.
+  const rideau = garde((tl, o) => {
+    o = o || {};
+    const n = calque('md-rideau');
+    if (!tl) return;
+    if (n.dataset.built !== '1') {
+      const cols = Math.max(2, Math.min(12, num(o.cols, 6)));
+      n.style.display = 'flex';
+      for (let i = 0; i < cols; i += 1) {
+        const b = document.createElement('div');
+        b.style.flex = '1';
+        b.style.background = o.color || '#05070d';
+        b.style.transformOrigin = '50% 0%';
+        n.appendChild(b);
+      }
+      n.dataset.built = '1';
+    }
+    const at0 = num(o.at, 0);
+    const dur = num(o.dur, 0.55);
+    const bands = Array.prototype.slice.call(n.children);
+    if (o.mode === 'open') {
+      tl.fromTo(bands, { scaleY: 1 }, { scaleY: 0, duration: dur, ease: 'power3.inOut',
+        stagger: { each: 0.045, from: o.sens === 'fin' ? 'start' : 'end' } }, at0);
+      voit(tl, n, 'flex', at0, dur + 0.32);
+    } else {
+      tl.fromTo(bands, { scaleY: 0 }, { scaleY: 1, duration: dur, ease: 'power3.inOut',
+        stagger: { each: 0.045, from: o.sens === 'fin' ? 'end' : 'start' } }, at0);
+      tl.set(n, { display: 'flex' }, Math.max(0, at0 - 0.02));
+    }
+    return n;
+  });
+
+  // Iris : cercle qui se referme (close) ou s'ouvre (open).
+  const iris = garde((tl, o) => {
+    o = o || {};
+    const n = calque('md-iris', 'background:' + (o.color || '#05070d') + ';');
+    if (!tl) return;
+    const at0 = num(o.at, 0);
+    const dur = num(o.dur, 0.6);
+    if (o.mode === 'open') {
+      tl.fromTo(n, { clipPath: 'circle(0% at 50% 50%)' }, { clipPath: 'circle(142% at 50% 50%)', duration: dur, ease: 'power3.inOut' }, at0);
+      voit(tl, n, 'block', at0, dur + 0.08);
+    } else {
+      tl.fromTo(n, { clipPath: 'circle(142% at 50% 50%)' }, { clipPath: 'circle(0% at 50% 50%)', duration: dur, ease: 'power3.inOut' }, at0);
+      tl.set(n, { display: 'block' }, Math.max(0, at0 - 0.02));
+    }
+    return n;
+  });
+
+  // Vague : bandes horizontales qui balaient en zigzag.
+  const vague = garde((tl, o) => {
+    o = o || {};
+    const n = calque('md-vague');
+    if (!tl) return;
+    if (n.dataset.built !== '1') {
+      const lignes = Math.max(2, Math.min(10, num(o.bandes, 5)));
+      n.style.display = 'flex';
+      n.style.flexDirection = 'column';
+      for (let i = 0; i < lignes; i += 1) {
+        const b = document.createElement('div');
+        b.style.flex = '1';
+        b.style.background = o.color || '#05070d';
+        n.appendChild(b);
+      }
+      n.dataset.built = '1';
+    }
+    const at0 = num(o.at, 0);
+    const dur = num(o.dur, 0.5);
+    const stg = num(o.stagger, 0.06);
+    const bands = Array.prototype.slice.call(n.children);
+    if (o.mode === 'open') {
+      bands.forEach((b, i) => tl.to(b, { xPercent: i % 2 ? -106 : 106, duration: dur, ease: 'power3.in' }, at0 + i * stg));
+      voit(tl, n, 'flex', at0, dur + stg * bands.length + 0.08);
+    } else {
+      bands.forEach((b, i) => tl.fromTo(b, { xPercent: i % 2 ? 106 : -106 }, { xPercent: 0, duration: dur, ease: 'power3.out' }, at0 + i * stg));
+      tl.set(n, { display: 'flex' }, Math.max(0, at0 - 0.02));
+    }
+    return n;
+  });
+
+  // Pleine page : un panneau de couleur traverse l'écran.
+  const flood = garde((tl, o) => {
+    o = o || {};
+    const n = calque('md-flood', 'background:' + (o.color || '#0b1220') + ';');
+    if (!tl) return;
+    const at0 = num(o.at, 0);
+    const dur = num(o.dur, 0.45);
+    if (o.mode === 'open') {
+      tl.fromTo(n, { xPercent: 0 }, { xPercent: 103, duration: dur, ease: 'power3.inOut' }, at0);
+      voit(tl, n, 'block', at0, dur + 0.08);
+    } else {
+      tl.fromTo(n, { xPercent: -103 }, { xPercent: 0, duration: dur, ease: 'power3.inOut' }, at0);
+      tl.set(n, { display: 'block' }, Math.max(0, at0 - 0.02));
+    }
+    return n;
+  });
+
+  // Fondu en deux temps vers le noir : ouverture douce de scène ou générique de fin.
+  const fondu2 = garde((tl, o) => {
+    o = o || {};
+    const n = calque('md-fondu', 'background:#000;');
+    if (!tl) return;
+    const at0 = num(o.at, 0);
+    if (o.mode === 'open') {
+      tl.fromTo(n, { opacity: 1 }, { opacity: 0, duration: num(o.dur, 0.5), ease: 'power2.out' }, at0);
+      voit(tl, n, 'block', at0, num(o.dur, 0.5) + 0.08);
+    } else {
+      tl.fromTo(n, { opacity: 0 }, { opacity: 1, duration: num(o.dur, 0.35), ease: 'power2.in' }, at0);
+      tl.set(n, { display: 'block' }, Math.max(0, at0 - 0.02));
+    }
+    return n;
+  });
+
+  window.MD = {
+    grainFX, splitChars, heroWord, accent, maskLine, popIn, outSlide, outMask,
+    driftCam, kenBurns, parallax, countTo, bar, ring, drawPath, flash,
+    rideau, iris, vague, flood, fondu2
+  };
+})();
+
 0;
 """
 

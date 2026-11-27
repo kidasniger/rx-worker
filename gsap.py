@@ -1,8 +1,18 @@
-"""Animation IA RENDRAX : écrit les scènes gsapvideo avec GLM-4.5-Flash (Z.ai).
+"""Animation IA RENDRAX : écrit les scènes gsapvideo avec GLM (Z.ai).
 
 Par défaut, seuls des états sont journalisés. Avec DEBUG_LOGS=1 (variable de dépôt
 GSAP_DEBUG, à réserver aux tests : le dépôt est public), tout le déroulé est affiché.
-Variables : JOB_ID, ZAI_API_KEY, ZAI_MODEL (défaut glm-4.5-flash), ZAI_THINKING.
+Variables : JOB_ID, ZAI_API_KEY, ZAI_MODEL (défaut glm-4.5-flash), ZAI_MODEL_RETRY
+(modèle plus fort pour les tentatives 2+, défaut : ZAI_MODEL), ZAI_THINKING.
+
+Fiabilité :
+  - une réponse tronquée (finish_reason=length) est détectée et relancée avec plus
+    de jetons au lieu de produire un JSON illisible ;
+  - le JSON est vérifié localement AVANT l'appel serveur (aller-retour évité) ;
+  - le bloc refusé est renvoyé dans la consigne de correction : le modèle corrige
+    son propre code au lieu de repartir de zéro ;
+  - chaque changement d'état est relayé à l'écran de suivi (gsapw-progress) et un
+    bilan JSON est publié à la fin du run (gsapw-metrics).
 """
 import json
 import os
@@ -19,6 +29,7 @@ BASE = "https://rendrax.vercel.app/api/generate"
 AUDIENCE = "https://rendrax.vercel.app/kidas-render"
 ZAI_URL = "https://api.z.ai/api/paas/v4/chat/completions"
 MODEL = os.environ.get("ZAI_MODEL", "glm-4.5-flash")
+MODEL_RETRY = (os.environ.get("ZAI_MODEL_RETRY", "") or "").strip() or MODEL
 THINKING = os.environ.get("ZAI_THINKING", "disabled")
 KEY = os.environ.get("ZAI_API_KEY", "")
 JOB_ID = os.environ.get("JOB_ID", "")
@@ -27,11 +38,28 @@ DEBUG = os.environ.get("DEBUG_LOGS", "") == "1"
 ESSAIS_SCENE = 3
 ESSAIS_API = 5
 PAUSE_SCENES = 3
+MAX_TOKENS = 1500
+MAX_TOKENS_TRONQUE = 2600
 
 if not re.fullmatch(r"[A-Za-z0-9_-]{6,64}", JOB_ID) or not RUN_ID.isdigit():
     sys.exit("Paramètres invalides.")
 if not KEY:
     sys.exit("Clé du service d'IA absente.")
+
+# Bilan du run, publié via gsapw-metrics à la fin (journalisation côté serveur).
+DEBUT = time.time()
+METRICS = {
+    "total_prevu": 0,
+    "scenes": 0,
+    "premier_essai": 0,
+    "essais_total": 0,
+    "tronques": 0,
+    "jetons_envoyes": 0,
+    "jetons_recus": 0,
+    "modeles": {},
+    "refus": [],
+    "duree_s": 0.0,
+}
 
 
 def log(message):
@@ -40,6 +68,10 @@ def log(message):
 
 class Boucle(RuntimeError):
     pass
+
+
+class Tronque(RuntimeError):
+    """Réponse coupée par la limite de jetons (finish_reason=length)."""
 
 
 class Garde:
@@ -128,9 +160,44 @@ def vercel(action, charge=None):
     return json.loads(brut)
 
 
+def signaler(phase, scene_n=0, scene_total=0, essai=0, label=""):
+    """Relais de progression vers l'écran de suivi (jamais bloquant).
+
+    L'action gsapw-progress est best effort : une indisponibilité temporaire
+    de Vercel n'interrompt jamais l'écriture des scènes.
+    """
+    try:
+        vercel("gsapw-progress", {
+            "current": int(scene_n),
+            "total": int(scene_total),
+            "essai": int(essai),
+            "phase": str(phase)[:24],
+            "label": str(label)[:80],
+        })
+    except Exception as erreur:  # noqa: BLE001
+        log("  progression non transmise (%s) : %s" % (phase, type(erreur).__name__))
+
+
+def comptabiliser(usage):
+    """Additionne les jetons du run pour le bilan gsapw-metrics."""
+    if not isinstance(usage, dict):
+        return
+    try:
+        METRICS["jetons_envoyes"] += int(usage.get("prompt_tokens") or 0)
+        METRICS["jetons_recus"] += int(usage.get("completion_tokens") or 0)
+    except (TypeError, ValueError):
+        pass
+
+
+def noter_refus(motif):
+    if len(METRICS["refus"]) < 24:
+        METRICS["refus"].append(str(motif)[:160])
+
+
 def lire_flux(reponse, debut):
     contenu = []
     premier = None
+    fin_flot = None
     mode = None
     usage = None
     garde = Garde()
@@ -153,6 +220,8 @@ def lire_flux(reponse, debut):
             if morceau.get("usage"):
                 usage = morceau["usage"]
             choix = (morceau.get("choices") or [{}])[0]
+            if choix.get("finish_reason"):
+                fin_flot = choix["finish_reason"]
             delta = choix.get("delta") or {}
             pensee = delta.get("reasoning_content") or ""
             texte = delta.get("content") or ""
@@ -180,18 +249,24 @@ def lire_flux(reponse, debut):
             print("::endgroup::", flush=True)
     if usage:
         log("  jetons : envoyés %s, reçus %s" % (usage.get("prompt_tokens"), usage.get("completion_tokens")))
-    return "".join(contenu)
+    return "".join(contenu), fin_flot, usage
 
 
-def ecrire(systeme, utilisateur):
+def ecrire(systeme, utilisateur, model=MODEL, max_tokens=MAX_TOKENS):
+    """Une réponse du modèle : relances réseau, troncature et boucle gérées ici.
+
+    Renvoie (texte, finish_reason, usage). Une réponse tronquée relance l'appel
+    avec un plafond de jetons relevé (une fois) au lieu de produire un JSON
+    coupé que le contrôle servirait à rejeter.
+    """
     corps = {
-        "model": MODEL,
+        "model": model,
         "messages": [
             {"role": "system", "content": systeme},
             {"role": "user", "content": utilisateur},
         ],
         "temperature": 0.4,
-        "max_tokens": 1500,
+        "max_tokens": max_tokens,
         "stream": True,
     }
     if THINKING in ("enabled", "disabled"):
@@ -208,11 +283,18 @@ def ecrire(systeme, utilisateur):
             ZAI_URL, data=json.dumps(corps).encode("utf-8"), headers=entetes, method="POST")
         try:
             with urllib.request.urlopen(requete, timeout=90) as reponse:
-                texte = lire_flux(reponse, debut)
+                texte, fin_flot, usage = lire_flux(reponse, debut)
             log("  réponse reçue : %d caractères en %.1f s" % (len(texte), time.time() - debut))
             if not texte.strip():
                 raise RuntimeError("réponse vide")
-            return texte
+            if fin_flot == "length":
+                METRICS["tronques"] += 1
+                corps["max_tokens"] = max(int(corps.get("max_tokens") or 0), MAX_TOKENS_TRONQUE)
+                log("  réponse tronquée (finish_reason=length), relance avec max_tokens=%s" % corps["max_tokens"])
+                raise Tronque()
+            return texte, fin_flot, usage
+        except Tronque:
+            continue
         except Boucle as erreur:
             log("  boucle détectée (%s), nouvel essai avec plus de variété" % erreur)
             continue
@@ -237,26 +319,90 @@ def ecrire(systeme, utilisateur):
     raise RuntimeError("service d'IA indisponible après %s essais" % ESSAIS_API)
 
 
+def controle_local(texte):
+    """Contrôle gratuit avant l'appel serveur : l'objet JSON doit exister et tenir debout.
+
+    Renvoie None si le JSON est lisible, sinon le motif du refus (évite un
+    aller-retour gsapw-check pour un problème détectable en local).
+    """
+    brut = str(texte or "")
+    debut, fin = brut.find("{"), brut.rfind("}")
+    if debut < 0 or fin <= debut:
+        return "aucun objet JSON trouvé (réponse vide, tronquée ou hors sujet)"
+    try:
+        json.loads(brut[debut:fin + 1])
+    except ValueError as erreur:
+        return "JSON invalide : %s" % erreur
+    return None
+
+
+def publier_metriques(total_scenes):
+    """Bilan du run côté serveur (taux d'acceptation au 1er essai, jetons, refus)."""
+    if not METRICS["duree_s"]:
+        METRICS["duree_s"] = round(time.time() - DEBUT, 1)
+    try:
+        vercel("gsapw-metrics", {
+            "total": int(total_scenes or METRICS["total_prevu"]),
+            "scenes": METRICS["scenes"],
+            "premier_essai": METRICS["premier_essai"],
+            "essais_total": METRICS["essais_total"],
+            "tronques": METRICS["tronques"],
+            "jetons_envoyes": METRICS["jetons_envoyes"],
+            "jetons_recus": METRICS["jetons_recus"],
+            "modeles": METRICS["modeles"],
+            "refus": METRICS["refus"][:12],
+            "duree_s": METRICS["duree_s"],
+        })
+        log("Bilan publié (gsapw-metrics).")
+    except Exception as erreur:  # noqa: BLE001
+        log("Bilan non publié : %s" % type(erreur).__name__)
+    log("BILAN " + json.dumps({
+        "scenes": METRICS["scenes"], "total": total_scenes,
+        "premier_essai": METRICS["premier_essai"], "essais": METRICS["essais_total"],
+        "tronques": METRICS["tronques"],
+        "jetons": [METRICS["jetons_envoyes"], METRICS["jetons_recus"]],
+        "duree_s": METRICS["duree_s"],
+    }, ensure_ascii=False))
+
+
 def main():
+    debut_run = time.time()
     log("Récupération des scènes...")
     scenes = vercel("gsapw-source")["scenes"]
-    log("%d scène(s) à écrire (modèle %s, réflexion %s)." % (len(scenes), MODEL, THINKING))
+    METRICS["total_prevu"] = len(scenes)
+    log("%d scène(s) à écrire (modèle %s, renfort %s, réflexion %s)." % (len(scenes), MODEL, MODEL_RETRY, THINKING))
     log("Mode détaillé : " + ("oui" if DEBUG else "non"))
+    signaler("demarrage", 0, len(scenes), 0, "Animation IA : %d scène(s)" % len(scenes))
     for n, scene in enumerate(scenes, 1):
         index = scene["index"]
         utilisateur = scene["user"]
-        reussi = False
+        accepte = False
         for essai in range(1, ESSAIS_SCENE + 1):
-            log("Scène %d/%d : tentative %d" % (n, len(scenes), essai))
+            modele = MODEL if essai == 1 else MODEL_RETRY
+            METRICS["essais_total"] += 1
+            METRICS["modeles"][modele] = METRICS["modeles"].get(modele, 0) + 1
+            log("Scène %d/%d : tentative %d (modèle %s)" % (n, len(scenes), essai, modele))
+            signaler("ecriture", n, len(scenes), essai, "Scène %d/%d : écriture" % (n, len(scenes)))
             if DEBUG:
                 bloc("Consigne système (scène %d)" % n, scene["system"], "    # ")
                 bloc("Consigne de la scène %d" % n, utilisateur, "    > ")
             try:
-                contenu = ecrire(scene["system"], utilisateur)
+                contenu, fin_flot, usage = ecrire(scene["system"], utilisateur, model=modele)
             except Exception as erreur:  # noqa: BLE001
                 log("  erreur : %s" % erreur)
                 time.sleep(5)
                 continue
+            comptabiliser(usage)
+            probleme = controle_local(contenu)
+            if probleme:
+                log("  contrôle local : refusé (%s)" % probleme)
+                noter_refus("scène %d : %s" % (index + 1, probleme))
+                signaler("refuse", n, len(scenes), essai, "Scène %d : JSON illisible" % n)
+                utilisateur = (scene["user"] + "\n\n— TA RÉPONSE PRÉCÉDENTE (ILLISIBLE) —\n"
+                               + contenu[:2000] + "\n\n" + probleme
+                               + "\nRenvoie UNIQUEMENT l'objet JSON corrigé, sans texte autour.")
+                continue
+            signaler("controle", n, len(scenes), essai, "Scène %d/%d : validation" % (n, len(scenes)))
             try:
                 resultat = vercel("gsapw-check", {"index": index, "content": contenu})
             except Exception as erreur:  # noqa: BLE001
@@ -265,22 +411,35 @@ def main():
                 continue
             if resultat.get("ok"):
                 log("  contrôle : accepté")
-                reussi = True
+                accepte = True
+                if essai == 1:
+                    METRICS["premier_essai"] += 1
+                signaler("accepte", n, len(scenes), essai, "Scène %d/%d : acceptée" % (n, len(scenes)))
                 break
             log("  contrôle : refusé")
             fix = str(resultat.get("fix", ""))
+            noter_refus("scène %d : %s" % (index + 1, fix))
             if DEBUG:
                 bloc("Problèmes signalés par le contrôle", fix, "    ! ")
-            utilisateur = scene["user"] + "\n\n" + fix
-        if not reussi:
+            # Le bloc refusé accompagne la correction : le modèle voit son code
+            # et corrige au lieu de tout réinventer (cause n°1 d'échecs en série).
+            utilisateur = (scene["user"] + "\n\n— TON BLOC PRÉCÉDENT (REFUSÉ) —\n"
+                           + contenu + "\n\n" + fix)
+            signaler("refuse", n, len(scenes), essai, "Scène %d/%d : corrigée" % (n, len(scenes)))
+        METRICS["scenes"] += 1
+        if not accepte:
             try:
                 vercel("gsapw-fail", {"index": index})
             except Exception as erreur:  # noqa: BLE001
                 log("  échec non signalé : %s" % erreur)
+            signaler("echec", n, len(scenes), essai, "Scène %d/%d : échec" % (n, len(scenes)))
             raise RuntimeError("scène %d non écrite" % (index + 1))
         log("Scène %d/%d écrite." % (n, len(scenes)))
         time.sleep(PAUSE_SCENES)
     log("Toutes les scènes sont écrites.")
+    signaler("fait", len(scenes), len(scenes), 0, "Animation IA : terminée")
+    METRICS["duree_s"] = round(time.time() - debut_run, 1)
+    publier_metriques(len(scenes))
 
 
 if __name__ == "__main__":
@@ -289,6 +448,9 @@ if __name__ == "__main__":
         main()
     except Exception as erreur:  # noqa: BLE001
         probleme = erreur
+        # Bilan publié même en échec : c'est ce qui permet de suivre le taux
+        # d'échec des scènes et les motifs de refus les plus fréquents.
+        publier_metriques(0)
     try:
         vercel("gsapw-cleanup", {})
     except Exception as erreur:  # noqa: BLE001
