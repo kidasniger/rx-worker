@@ -158,6 +158,41 @@ jobs:
           python -c "import websocket; print('websocket-client installé:', websocket.__version__)"
           python -c "import PIL; print('Pillow installé:', PIL.__version__)"
 
+      - name: Test fumée du navigateur (Chromium + GSAP, avant tout rendu)
+        timeout-minutes: 6
+        run: |
+          python - <<'PY'
+          import sys, tempfile
+          from pathlib import Path
+          sys.path.insert(0, ".")
+          from h2m.browser import CDP, launch_chrome, page_ws_url, stop_chrome
+          from h2m.deps import ensure_deps, find_chrome
+          ensure_deps()
+          exe = find_chrome()
+          if not exe:
+              raise SystemExit("::error::Chromium introuvable sur ce coureur : le rendu échouerait après de longues minutes. Arrêt immédiat.")
+          page = Path(tempfile.mkdtemp()) / "fumee.html"
+          page.write_text(
+              '<!doctype html><div id="c" style="width:100px;height:100px;background:#234"></div>'
+              '<script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/gsap.min.js"></script>'
+              '<script>window.err="";onerror=function(e){window.err=String(e)};'
+              'gsap.set("#c",{x:40,rotation:45});</script>', encoding="utf-8")
+          tmp = Path(tempfile.mkdtemp())
+          proc, port = launch_chrome(exe, tmp, 720, 720)
+          try:
+              nav = CDP(page_ws_url(port))
+              nav.call("Page.enable")
+              nav.call("Page.navigate", url=page.as_uri())
+              nav.ev("new Promise(r=>setTimeout(r,1200))")
+              ok = nav.ev("typeof gsap==='function' && !window.err && document.querySelector('#c').style.transform.indexOf('matrix')===0")
+              nav.close()
+          finally:
+              stop_chrome(proc)
+          if ok is not True:
+              raise SystemExit("::error::Test fumée échoué : GSAP ne s'exécute pas correctement dans Chromium.")
+          print("Test fumée navigateur : Chromium démarré, GSAP chargé et appliqué.")
+          PY
+
       - name: Rendre la vidéo
         env:
           FICHIER: ${{ steps.source.outputs.fichier }}
