@@ -2,7 +2,11 @@
 
 Par défaut, seuls des états sont journalisés. Avec DEBUG_LOGS=1 (variable de dépôt
 GSAP_DEBUG, à réserver aux tests : le dépôt est public), tout le déroulé est affiché.
-Variables : JOB_ID, ZAI_API_KEY, ZAI_MODEL (défaut glm-4.5-flash), ZAI_THINKING.
+Variables : JOB_ID, ZAI_API_KEY, ZAI_MODEL (défaut glm-4.5-flash), ZAI_THINKING,
+ZAI_MODEL_SECOURS (modèle de rechange après 2 échecs d'une même scène).
+Robustesse : réponse tronquée détectée (finish_reason "length" → nouvel essai avec
+plus de jetons), la correction d'une scène inclut la réponse refusée, et le modèle
+de secours prend le relais quand le modèle principal échoue à deux tentatives.
 """
 import json
 import os
@@ -18,8 +22,9 @@ import urllib.request
 BASE = "https://rendrax.vercel.app/api/generate"
 AUDIENCE = "https://rendrax.vercel.app/kidas-render"
 ZAI_URL = "https://api.z.ai/api/paas/v4/chat/completions"
-MODEL = os.environ.get("ZAI_MODEL", "glm-4.5-flash")
-THINKING = os.environ.get("ZAI_THINKING", "disabled")
+MODEL = os.environ.get("ZAI_MODEL") or "glm-4.5-flash"
+MODEL_SECOURS = os.environ.get("ZAI_MODEL_SECOURS") or ""
+THINKING = os.environ.get("ZAI_THINKING") or "disabled"
 KEY = os.environ.get("ZAI_API_KEY", "")
 JOB_ID = os.environ.get("JOB_ID", "")
 RUN_ID = os.environ.get("GITHUB_RUN_ID", "")
@@ -40,6 +45,10 @@ def log(message):
 
 class Boucle(RuntimeError):
     pass
+
+
+class Tronquee(RuntimeError):
+    """Réponse coupée par la limite de jetons (finish_reason "length")."""
 
 
 class Garde:
@@ -133,6 +142,7 @@ def lire_flux(reponse, debut):
     premier = None
     mode = None
     usage = None
+    raison = None
     garde = Garde()
     pensee_log = Lignes("    ~ ")
     code_log = Lignes("    | ")
@@ -153,6 +163,8 @@ def lire_flux(reponse, debut):
             if morceau.get("usage"):
                 usage = morceau["usage"]
             choix = (morceau.get("choices") or [{}])[0]
+            if choix.get("finish_reason"):
+                raison = choix["finish_reason"]
             delta = choix.get("delta") or {}
             pensee = delta.get("reasoning_content") or ""
             texte = delta.get("content") or ""
@@ -180,12 +192,15 @@ def lire_flux(reponse, debut):
             print("::endgroup::", flush=True)
     if usage:
         log("  jetons : envoyés %s, reçus %s" % (usage.get("prompt_tokens"), usage.get("completion_tokens")))
+    if raison == "length":
+        # Réponse coupée en pleine phrase : forcément inutilisable, on le sait tout de suite.
+        raise Tronquee("limite de jetons atteinte")
     return "".join(contenu)
 
 
-def ecrire(systeme, utilisateur):
+def ecrire(systeme, utilisateur, modele=None):
     corps = {
-        "model": MODEL,
+        "model": modele or MODEL,
         "messages": [
             {"role": "system", "content": systeme},
             {"role": "user", "content": utilisateur},
@@ -215,6 +230,13 @@ def ecrire(systeme, utilisateur):
             return texte
         except Boucle as erreur:
             log("  boucle détectée (%s), nouvel essai avec plus de variété" % erreur)
+            continue
+        except Tronquee as erreur:
+            if corps["max_tokens"] < 2600:
+                corps["max_tokens"] = min(corps["max_tokens"] * 2, 2600)
+                log("  réponse tronquée (%s), nouvel essai avec %s jetons max" % (erreur, corps["max_tokens"]))
+            else:
+                log("  réponse tronquée (%s), nouvel essai" % erreur)
             continue
         except urllib.error.HTTPError as erreur:
             statut = erreur.code
@@ -246,13 +268,14 @@ def main():
         index = scene["index"]
         utilisateur = scene["user"]
         reussi = False
+        modele_scene = MODEL
         for essai in range(1, ESSAIS_SCENE + 1):
-            log("Scène %d/%d : tentative %d" % (n, len(scenes), essai))
+            log("Scène %d/%d : tentative %d (modèle %s)" % (n, len(scenes), essai, modele_scene))
             if DEBUG:
                 bloc("Consigne système (scène %d)" % n, scene["system"], "    # ")
                 bloc("Consigne de la scène %d" % n, utilisateur, "    > ")
             try:
-                contenu = ecrire(scene["system"], utilisateur)
+                contenu = ecrire(scene["system"], utilisateur, modele=modele_scene)
             except Exception as erreur:  # noqa: BLE001
                 log("  erreur : %s" % erreur)
                 time.sleep(5)
@@ -271,7 +294,15 @@ def main():
             fix = str(resultat.get("fix", ""))
             if DEBUG:
                 bloc("Problèmes signalés par le contrôle", fix, "    ! ")
-            utilisateur = scene["user"] + "\n\n" + fix
+            # La correction montre la réponse refusée : l'IA corrige au lieu de redeviner.
+            utilisateur = (scene["user"]
+                + "\n\n--- TA RÉPONSE PRÉCÉDENTE (refusée par le contrôle) ---\n"
+                + contenu[:6000]
+                + "\n\n--- PROBLÈMES À CORRIGER ---\n" + fix
+                + "\n\nRenvoie UNIQUEMENT la réponse corrigée, même format que demandé.")
+            if essai >= 2 and MODEL_SECOURS and modele_scene != MODEL_SECOURS:
+                log("  passage au modèle de secours %s" % MODEL_SECOURS)
+                modele_scene = MODEL_SECOURS
         if not reussi:
             try:
                 vercel("gsapw-fail", {"index": index})

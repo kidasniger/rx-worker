@@ -23,10 +23,37 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Pré-vol du service d'IA (échec rapide si la clé ou le modèle est invalide)
+        env:
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          ZAI_MODEL: ${{ vars.ZAI_MODEL }}
+        timeout-minutes: 2
+        run: |
+          python - <<'PY'
+          import json, os, urllib.request
+          cle = os.environ.get("ZAI_API_KEY") or ""
+          modele = os.environ.get("ZAI_MODEL") or "glm-4.5-flash"
+          if not cle:
+              raise SystemExit("::error::Clé du service d'IA absente (secret ZAI_API_KEY).")
+          requete = urllib.request.Request(
+              "https://api.z.ai/api/paas/v4/chat/completions",
+              data=json.dumps({"model": modele, "messages": [{"role": "user", "content": "ok"}], "max_tokens": 4}).encode("utf-8"),
+              headers={"Authorization": "Bearer " + cle, "Content-Type": "application/json"})
+          try:
+              with urllib.request.urlopen(requete, timeout=30) as reponse:
+                  json.loads(reponse.read())
+          except Exception as erreur:
+              raise SystemExit("::error::Service d'IA injoignable (%s). Vérifie le secret ZAI_API_KEY et le modèle %s." % (type(erreur).__name__, modele))
+          print("Service d'IA joint (modèle %s)." % modele)
+          PY
+
       - name: Écrire les scènes
         env:
           JOB_ID: ${{ inputs.job_id }}
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          ZAI_MODEL: ${{ vars.ZAI_MODEL }}
+          ZAI_MODEL_SECOURS: ${{ vars.ZAI_MODEL_SECOURS }}
+          ZAI_THINKING: ${{ vars.ZAI_THINKING }}
           DEBUG_LOGS: ${{ vars.GSAP_DEBUG }}
           PYTHONUNBUFFERED: "1"
         run: python gsap.py
